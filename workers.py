@@ -3,7 +3,7 @@ import re
 import time
 from pyrogram import Client, filters
 from pyrogram.types import Message
-from pyrogram.errors import FloodWait, RPCError  # SessionRevokedError حذف شد
+from pyrogram.errors import FloodWait, RPCError  # ✅ فقط این دو خطا ایمپورت می‌شوند
 from config import API_ID, API_HASH, BOT_USER_ID
 from database import get_user, get_all_users, DEFAULT_FISH_RULES, DEFAULT_COOKED_RULES
 
@@ -279,13 +279,9 @@ async def handle_fridge_message(message: Message, phone: str, rules: dict, cooke
 
 
 # ==============================================
-# ⭐ تابع کلیک با Retry هر ۱ ثانیه (مقاوم در برابر تایم‌اوت)
+# ⭐ تابع کلیک با Retry هر ۱ ثانیه
 # ==============================================
 async def click_until_reply(client: Client, message: Message, button_index: int, chat_id: int):
-    """
-    هر ۱ ثانیه روی دکمه‌ی مشخص کلیک می‌کنه تا وقتی که یک پیام جدید از طرف بات (غیر از خود message) بیاد.
-    مقاوم در برابر FloodWait.
-    """
     last_known_msg_id = message.id
     while True:
         try:
@@ -316,7 +312,7 @@ async def click_until_reply(client: Client, message: Message, button_index: int,
 
 
 # ==============================================
-# ⭐ قاچاق میویی (دو مرحله‌ای با کول‌داون ۱ ساعته)
+# ⭐ قاچاق میویی (دو مرحله‌ای)
 # ==============================================
 async def handle_smuggle(client: Client, chat_id: int, phone: str):
     step = get_cd_left(phone, "smuggle_step")
@@ -482,7 +478,7 @@ async def selfbot_worker(phone: str):
             await asyncio.sleep(20)
             continue
 
-        # ===== مدیریت امن گروه‌ها (رفع خطای ASCII) =====
+        # ===== مدیریت امن گروه‌ها =====
         if user.get("selected_groups"):
             raw_groups = user["selected_groups"]
             chat_ids = []
@@ -506,7 +502,7 @@ async def selfbot_worker(phone: str):
 
         print(f"📋 گروه‌های هدف {phone}: {chat_ids}")
 
-        # ===== پاکسازی session_string از کاراکترهای غیرمجاز =====
+        # ===== پاکسازی session_string =====
         raw_session = user["session_string"]
         if raw_session:
             cleaned_session = re.sub(r'[^A-Za-z0-9+/=]', '', raw_session)
