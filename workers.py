@@ -1,10 +1,10 @@
 import asyncio
 import re
 import time
-import json
+import sqlite3
 from pyrogram import Client, filters
 from pyrogram.types import Message
-from pyrogram.errors import FloodWait, RPCError
+from pyrogram.errors import FloodWait, RPCError, SessionRevokedError
 from config import API_ID, API_HASH, BOT_USER_ID
 from database import get_user, get_all_users, DEFAULT_FISH_RULES, DEFAULT_COOKED_RULES
 
@@ -279,13 +279,9 @@ async def handle_fridge_message(message: Message, phone: str, rules: dict, cooke
         return
 
 # ==============================================
-# ⭐ تابع کلیک با Retry هر ۱ ثانیه (مقاوم در برابر تایم‌اوت)
+# ⭐ تابع کلیک با Retry هر ۱ ثانیه
 # ==============================================
 async def click_until_reply(client: Client, message: Message, button_index: int, chat_id: int):
-    """
-    هر ۱ ثانیه روی دکمه‌ی مشخص کلیک می‌کنه تا وقتی که یک پیام جدید از طرف بات (غیر از خود message) بیاد.
-    مقاوم در برابر FloodWait.
-    """
     last_known_msg_id = message.id
     while True:
         try:
@@ -315,7 +311,7 @@ async def click_until_reply(client: Client, message: Message, button_index: int,
                 break
 
 # ==============================================
-# ⭐ قاچاق میویی (دو مرحله‌ای با کول‌داون ۱ ساعته)
+# ⭐ قاچاق میویی (دو مرحله‌ای)
 # ==============================================
 async def handle_smuggle(client: Client, chat_id: int, phone: str):
     step = get_cd_left(phone, "smuggle_step")
@@ -355,12 +351,12 @@ async def handle_smuggle(client: Client, chat_id: int, phone: str):
             await click_until_reply(client, response, 0, chat_id)
         if total >= 3:
             await click_until_reply(client, response, 2, chat_id)
-        set_cd(phone, "smuggle_step", 1)  # مرحله ۱ (با duration نامحدود)
+        set_cd(phone, "smuggle_step", 1)
     else:  # مرحله دوم: فقط دکمه اول
         if total >= 1:
             await click_until_reply(client, response, 0, chat_id)
-        set_cd(phone, "smuggle_step", 0)  # ریست
-        set_cd(phone, "smuggle_cooldown", 3600)  # ۱ ساعت کول‌داون
+        set_cd(phone, "smuggle_step", 0)
+        set_cd(phone, "smuggle_cooldown", 3600)
 
 async def smuggle_loop(client: Client, phone: str, chat_id: int):
     while True:
@@ -372,7 +368,7 @@ async def smuggle_loop(client: Client, phone: str, chat_id: int):
         await asyncio.sleep(5)
 
 # ==============================================
-# پردازش پیام‌های دریافتی (با اضافه‌های جدید)
+# پردازش پیام‌های دریافتی
 # ==============================================
 async def process_bot_message(c: Client, message: Message, phone: str):
     try:
@@ -397,7 +393,7 @@ async def process_bot_message(c: Client, message: Message, phone: str):
         rules = u.get("fish_rules") or DEFAULT_FISH_RULES
         cooked_rules = u.get("cooked_rules") or DEFAULT_COOKED_RULES
 
-        # ===== قاچاق میویی (دستی) =====
+        # قاچاق میویی (دستی)
         if "قاچاق میویی" in text and message.reply_to_message and message.reply_to_message.from_user.id == (await c.get_me()).id:
             left = get_cd_left(phone, "smuggle_cooldown")
             if left <= 0:
@@ -407,14 +403,14 @@ async def process_bot_message(c: Client, message: Message, phone: str):
                 print(f"⏳ قاچاق میویی {int(left)} ثانیه مونده")
             return
 
-        # ===== خفاش =====
+        # خفاش
         if "خفاش" in text:
             if has_btn(message, "خفاش"):
                 await click_exact(message, "خفاش")
                 print("🦇 خفاش کلیک شد")
             return
 
-        # ===== بقیه موارد قبلی =====
+        # بقیه موارد
         if "ماهیا هنوز خوابن" in text or ("باید" in text and "صبر" in text):
             wait = parse_wait_seconds(text)
             if wait:
@@ -466,7 +462,26 @@ async def process_bot_message(c: Client, message: Message, phone: str):
         print(f"⚠️ خطا پردازش پیام [{phone}]: {e}")
 
 # ==============================================
-# تابع اصلی Worker (با اصلاح گروه‌ها و session_string)
+# تابع کمکی برای به‌روزرسانی session_string در دیتابیس
+# ==============================================
+def update_session_in_db(phone: str, new_session: str):
+    try:
+        conn = sqlite3.connect('data/users.db')
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE users SET session_string = ? WHERE phone = ?",
+            (new_session, phone)
+        )
+        conn.commit()
+        conn.close()
+        print(f"✅ session_string برای {phone} در دیتابیس به‌روز شد.")
+        return True
+    except Exception as e:
+        print(f"❌ خطا در به‌روزرسانی دیتابیس: {e}")
+        return False
+
+# ==============================================
+# تابع اصلی Worker (با قابلیت خودترمیمی)
 # ==============================================
 async def selfbot_worker(phone: str):
     print(f"🚀 Worker شروع شد برای {phone}")
@@ -478,23 +493,18 @@ async def selfbot_worker(phone: str):
             await asyncio.sleep(20)
             continue
 
-        # ==============================================
-        # ⭐ اصلاح ۱: مدیریت امن گروه‌ها (رفع خطای ASCII)
-        # ==============================================
+        # ===== مدیریت گروه‌ها =====
         if user.get("selected_groups"):
             raw_groups = user["selected_groups"]
             chat_ids = []
             for g in raw_groups:
                 try:
                     if isinstance(g, str):
-                        # حذف کاراکترهای غیرعددی (به جز منفی)
                         cleaned = ''.join(c for c in g if c.isdigit() or c == '-')
                         if cleaned:
                             chat_ids.append(int(cleaned))
                     elif isinstance(g, int):
                         chat_ids.append(g)
-                    else:
-                        print(f"⚠️ نوع داده نامعتبر: {type(g)} -> {g}")
                 except (ValueError, TypeError) as e:
                     print(f"⚠️ شناسه نامعتبر نادیده گرفته شد: {g} -> {e}")
                     continue
@@ -504,38 +514,72 @@ async def selfbot_worker(phone: str):
         else:
             chat_ids = [-1003998125518]
             print("⚠️ گروه پیش‌فرض")
-
         print(f"📋 گروه‌های هدف {phone}: {chat_ids}")
 
-        # ==============================================
-        # ⭐ اصلاح ۲: پاکسازی session_string (رفع خطای اصلی)
-        # ==============================================
+        # ===== پاکسازی session_string =====
         raw_session = user["session_string"]
-        if raw_session:
-            # فقط کاراکترهای مجاز base64 (A-Z a-z 0-9 + / =) را نگه دار
-            cleaned_session = re.sub(r'[^A-Za-z0-9+/=]', '', raw_session)
-        else:
-            cleaned_session = ""
-        
-        # لاگ برای دیباگ
+        cleaned_session = re.sub(r'[^A-Za-z0-9+/=]', '', raw_session) if raw_session else ""
         print(f"🔑 طول session پاکسازی‌شده: {len(cleaned_session)} (اصلی: {len(raw_session)})")
-        
-        # اگر بعد از پاکسازی خالی شد، خطا بده
-        if not cleaned_session:
-            print(f"❌ session_string برای {phone} نامعتبر است. لطفاً دوباره لاگین کنید.")
-            await asyncio.sleep(60)
-            continue
 
-        client = Client(
-            name=f"sb_{phone}",
-            session_string=cleaned_session,
-            api_id=API_ID,
-            api_hash=API_HASH,
-            in_memory=True
-        )
-
+        # ===== تلاش برای ساخت Client =====
+        client = None
         try:
+            client = Client(
+                name=f"sb_{phone}",
+                session_string=cleaned_session,
+                api_id=API_ID,
+                api_hash=API_HASH,
+                in_memory=True
+            )
             await client.start()
+        except (ValueError, SessionRevokedError, Exception) as e:
+            print(f"⚠️ session_string نامعتبر است: {e}")
+            if "unpack requires a buffer" in str(e) or "ASCII" in str(e):
+                print(f"🔄 تلاش برای لاگین مجدد {phone} با شماره تلفن...")
+                # اگر client ساخته شده بود، متوقفش کن
+                if client:
+                    try:
+                        await client.stop()
+                    except:
+                        pass
+                
+                # لاگین با phone_number
+                try:
+                    client = Client(
+                        name=f"sb_{phone}",
+                        api_id=API_ID,
+                        api_hash=API_HASH,
+                        phone_number=phone,
+                        in_memory=True
+                    )
+                    await client.start()
+                    # گرفتن session_string جدید
+                    new_session = await client.export_session_string()
+                    print(f"✅ session_string جدید تولید شد (طول: {len(new_session)})")
+                    # ذخیره در دیتابیس
+                    update_session_in_db(phone, new_session)
+                    # به‌روزرسانی cleaned_session
+                    cleaned_session = new_session
+                except Exception as e2:
+                    print(f"❌ لاگین مجدد ناموفق: {e2}")
+                    if client:
+                        try:
+                            await client.stop()
+                        except:
+                            pass
+                    await asyncio.sleep(30)
+                    continue
+            else:
+                if client:
+                    try:
+                        await client.stop()
+                    except:
+                        pass
+                await asyncio.sleep(15)
+                continue
+
+        # ===== ادامه کار با client سالم =====
+        try:
             me = await client.get_me()
             print(f"✅ {phone} آنلاین → {me.first_name}")
 
@@ -571,7 +615,7 @@ async def selfbot_worker(phone: str):
                 print(f"✏️ [{phone}] پیام ویرایش شد")
                 await process_bot_message(c, message, phone)
 
-            # ===== حلقه میو (به‌روز با click_until_reply) =====
+            # ===== حلقه‌ها =====
             async def meow_loop():
                 while True:
                     u = get_user(phone)
@@ -603,7 +647,6 @@ async def selfbot_worker(phone: str):
                             print(f"❌ میو: {e}")
                     await asyncio.sleep(interval)
 
-            # ===== حلقه ماهی (به‌روز) =====
             async def fish_loop():
                 while True:
                     u = get_user(phone)
@@ -631,7 +674,6 @@ async def selfbot_worker(phone: str):
                             print(f"❌ پیشی: {e}")
                     await asyncio.sleep(interval)
 
-            # ===== حلقه گرفتن (به‌روز) =====
             async def catch_loop():
                 while True:
                     u = get_user(phone)
@@ -663,7 +705,6 @@ async def selfbot_worker(phone: str):
                             print(f"❌ ماهی: {e}")
                     await asyncio.sleep(interval)
 
-            # ===== حلقه یخچال (بدون تغییر) =====
             async def fridge_loop():
                 while True:
                     u = get_user(phone)
@@ -692,13 +733,12 @@ async def selfbot_worker(phone: str):
                             print(f"❌ یخچال: {e}")
                     await asyncio.sleep(60)
 
-            # ===== استارت همه‌ی تسک‌ها (با اضافه شدن قاچاق) =====
             tasks = [
                 asyncio.create_task(meow_loop()),
                 asyncio.create_task(fish_loop()),
                 asyncio.create_task(catch_loop()),
                 asyncio.create_task(fridge_loop()),
-                asyncio.create_task(smuggle_loop(client, phone, chat_ids[0])),  # قاچاق میویی
+                asyncio.create_task(smuggle_loop(client, phone, chat_ids[0])),
             ]
 
             while True:
@@ -722,9 +762,7 @@ async def selfbot_worker(phone: str):
 
         await asyncio.sleep(15)
 
-# ==============================================
-# توابع مدیریت تسک‌ها
-# ==============================================
+
 def start_worker(phone: str, loop):
     if phone in active_tasks and not active_tasks[phone].done():
         return
