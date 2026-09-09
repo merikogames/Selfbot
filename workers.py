@@ -3,7 +3,7 @@ import re
 import time
 from pyrogram import Client, filters
 from pyrogram.types import Message
-from pyrogram.errors import FloodWait, RPCError  # ✅ فقط این دو خطا ایمپورت می‌شوند
+from pyrogram.errors import FloodWait, RPCError, SessionRevoked, AuthKeyUnregistered, UserDeactivated, UserDeactivatedBan
 from config import API_ID, API_HASH, BOT_USER_ID
 from database import get_user, get_all_users, DEFAULT_FISH_RULES, DEFAULT_COOKED_RULES
 
@@ -18,13 +18,14 @@ FRIDGE_CHECK_CD = 20 * 60
 
 cooldowns = {}
 
-# ========== تنظیمات سرعت ==========
+# صف سراسری بین همه اکانت‌ها
 _global_lock = asyncio.Lock()
 _last_global_action = 0.0
-GLOBAL_GAP = 0.3
+GLOBAL_GAP = 10  # ثانیه بین هر کلیک/ارسال
 
 
 async def global_slot(tag: str = ""):
+    """صف مشترک — قبل از هر کلیک یا send_message"""
     global _last_global_action
     async with _global_lock:
         now = time.time()
@@ -278,101 +279,6 @@ async def handle_fridge_message(message: Message, phone: str, rules: dict, cooke
         return
 
 
-# ==============================================
-# ⭐ تابع کلیک با Retry هر ۱ ثانیه
-# ==============================================
-async def click_until_reply(client: Client, message: Message, button_index: int, chat_id: int):
-    last_known_msg_id = message.id
-    while True:
-        try:
-            await global_slot(f"retry_click:{button_index}")
-            await message.click(button_index)
-            print(f"🔄 کلیک روی دکمه {button_index+1} (تلاش مجدد)")
-        except FloodWait as e:
-            print(f"⏳ تلگرام گفت {e.value} ثانیه صبر کن. صبر می‌کنم...")
-            await asyncio.sleep(e.value)
-            continue
-        except Exception as e:
-            print(f"⚠️ خطا در کلیک: {e}")
-
-        await asyncio.sleep(1)
-
-        try:
-            last_messages = []
-            async for msg in client.get_chat_history(chat_id, limit=2):
-                last_messages.append(msg)
-        except RPCError:
-            continue
-
-        if len(last_messages) > 0:
-            latest = last_messages[0]
-            if latest.from_user and latest.from_user.is_bot and latest.id != last_known_msg_id:
-                print("✅ جواب از بات رسید، کلیک‌ها متوقف شد.")
-                break
-
-
-# ==============================================
-# ⭐ قاچاق میویی (دو مرحله‌ای)
-# ==============================================
-async def handle_smuggle(client: Client, chat_id: int, phone: str):
-    step = get_cd_left(phone, "smuggle_step")
-    if step is None or step == 0:
-        step = 0
-    else:
-        step = 1 if get_cd_left(phone, "smuggle_step") > 0 else 0
-
-    try:
-        sent = await client.send_message(chat_id, "قاچاق میویی")
-        print(f"📤 'قاچاق میویی' ارسال شد (مرحله {step+1})")
-    except Exception as e:
-        print(f"❌ خطا در ارسال: {e}")
-        return
-
-    try:
-        response = await client.wait_for(
-            "message",
-            timeout=30,
-            filters=lambda m: m.chat.id == chat_id and m.reply_to_message and m.reply_to_message.id == sent.id
-        )
-    except asyncio.TimeoutError:
-        print("⏰ پاسخ نیومد")
-        return
-    except Exception as e:
-        print(f"❌ خطا در انتظار: {e}")
-        return
-
-    if not response.reply_markup or not response.reply_markup.inline_keyboard:
-        print("❌ دکمه‌ای وجود ندارد")
-        return
-
-    total = sum(len(row) for row in response.reply_markup.inline_keyboard)
-
-    if step == 0:  # مرحله اول: دکمه اول + آخر (ردیف سوم)
-        if total >= 1:
-            await click_until_reply(client, response, 0, chat_id)
-        if total >= 3:
-            await click_until_reply(client, response, 2, chat_id)
-        set_cd(phone, "smuggle_step", 1)
-    else:  # مرحله دوم: فقط دکمه اول
-        if total >= 1:
-            await click_until_reply(client, response, 0, chat_id)
-        set_cd(phone, "smuggle_step", 0)
-        set_cd(phone, "smuggle_cooldown", 3600)
-
-
-async def smuggle_loop(client: Client, phone: str, chat_id: int):
-    while True:
-        left = get_cd_left(phone, "smuggle_cooldown")
-        if left > 0:
-            await asyncio.sleep(min(left, 10))
-            continue
-        await handle_smuggle(client, chat_id, phone)
-        await asyncio.sleep(5)
-
-
-# ==============================================
-# پردازش پیام‌های دریافتی
-# ==============================================
 async def process_bot_message(c: Client, message: Message, phone: str):
     try:
         u = get_user(phone)
@@ -396,24 +302,6 @@ async def process_bot_message(c: Client, message: Message, phone: str):
         rules = u.get("fish_rules") or DEFAULT_FISH_RULES
         cooked_rules = u.get("cooked_rules") or DEFAULT_COOKED_RULES
 
-        # ===== قاچاق میویی (دستی) =====
-        if "قاچاق میویی" in text and message.reply_to_message and message.reply_to_message.from_user.id == (await c.get_me()).id:
-            left = get_cd_left(phone, "smuggle_cooldown")
-            if left <= 0:
-                print("🔄 درخواست دستی قاچاق میویی")
-                await handle_smuggle(c, message.chat.id, phone)
-            else:
-                print(f"⏳ قاچاق میویی {int(left)} ثانیه مونده")
-            return
-
-        # ===== خفاش =====
-        if "خفاش" in text:
-            if has_btn(message, "خفاش"):
-                await click_exact(message, "خفاش")
-                print("🦇 خفاش کلیک شد")
-            return
-
-        # ===== بقیه موارد =====
         if "ماهیا هنوز خوابن" in text or ("باید" in text and "صبر" in text):
             wait = parse_wait_seconds(text)
             if wait:
@@ -450,6 +338,7 @@ async def process_bot_message(c: Client, message: Message, phone: str):
                     await handle_fish_catch(message, rules, phone)
                     return
 
+        # برداشت — هر ۳۰ دقیقه یک‌بار
         if u.get("fish_enabled") and has_btn(message, harvest_btn, "برداشت میو"):
             left = get_cd_left(phone, "harvest")
             if left > 0:
@@ -465,9 +354,6 @@ async def process_bot_message(c: Client, message: Message, phone: str):
         print(f"⚠️ خطا پردازش پیام [{phone}]: {e}")
 
 
-# ==============================================
-# تابع اصلی Worker (با اصلاحات کامل)
-# ==============================================
 async def selfbot_worker(phone: str):
     print(f"🚀 Worker شروع شد برای {phone}")
 
@@ -478,41 +364,20 @@ async def selfbot_worker(phone: str):
             await asyncio.sleep(20)
             continue
 
-        # ===== مدیریت امن گروه‌ها =====
-        if user.get("selected_groups"):
-            raw_groups = user["selected_groups"]
-            chat_ids = []
-            for g in raw_groups:
-                try:
-                    if isinstance(g, str):
-                        cleaned = ''.join(c for c in g if c.isdigit() or c == '-')
-                        if cleaned:
-                            chat_ids.append(int(cleaned))
-                    elif isinstance(g, int):
-                        chat_ids.append(g)
-                except (ValueError, TypeError) as e:
-                    print(f"⚠️ شناسه نامعتبر نادیده گرفته شد: {g} -> {e}")
-                    continue
-            if not chat_ids:
-                chat_ids = [-1003998125518]
-                print("⚠️ گروه پیش‌فرض (پس از پاکسازی)")
+        if user["selected_groups"]:
+            chat_ids = [int(g) for g in user["selected_groups"]]
         else:
             chat_ids = [-1003998125518]
             print("⚠️ گروه پیش‌فرض")
 
         print(f"📋 گروه‌های هدف {phone}: {chat_ids}")
 
-        # ===== پاکسازی session_string =====
-        raw_session = user["session_string"]
-        if raw_session:
-            cleaned_session = re.sub(r'[^A-Za-z0-9+/=]', '', raw_session)
-        else:
-            cleaned_session = ""
-        print(f"🔑 طول session پاکسازی‌شده: {len(cleaned_session)} (اصلی: {len(raw_session)})")
+        # پاکسازی session_string از کاراکترهای اضافی
+        session_str = user["session_string"].strip().replace("\n", "").replace("\r", "").replace(" ", "")
 
         client = Client(
             name=f"sb_{phone}",
-            session_string=cleaned_session,
+            session_string=session_str,
             api_id=API_ID,
             api_hash=API_HASH,
             in_memory=True
@@ -555,7 +420,6 @@ async def selfbot_worker(phone: str):
                 print(f"✏️ [{phone}] پیام ویرایش شد")
                 await process_bot_message(c, message, phone)
 
-            # ===== حلقه میو =====
             async def meow_loop():
                 while True:
                     u = get_user(phone)
@@ -570,24 +434,13 @@ async def selfbot_worker(phone: str):
                     for cid in chat_ids:
                         try:
                             await global_slot("میو")
-                            sent = await client.send_message(cid, "میو")
+                            await client.send_message(cid, "میو")
                             print(f"😺 [{phone}] میو → {cid}")
-                            try:
-                                resp = await client.wait_for(
-                                    "message",
-                                    timeout=8,
-                                    filters=lambda m: m.chat.id == cid and m.reply_to_message and m.reply_to_message.id == sent.id
-                                )
-                                if resp.reply_markup and resp.reply_markup.inline_keyboard:
-                                    await click_until_reply(client, resp, 0, cid)
-                            except asyncio.TimeoutError:
-                                pass
                             await asyncio.sleep(2)
                         except Exception as e:
                             print(f"❌ میو: {e}")
                     await asyncio.sleep(interval)
 
-            # ===== حلقه ماهی =====
             async def fish_loop():
                 while True:
                     u = get_user(phone)
@@ -598,24 +451,13 @@ async def selfbot_worker(phone: str):
                     for cid in chat_ids:
                         try:
                             await global_slot("پیشی")
-                            sent = await client.send_message(cid, "پیشی")
+                            await client.send_message(cid, "پیشی")
                             print(f"🐱 [{phone}] پیشی → {cid}")
-                            try:
-                                resp = await client.wait_for(
-                                    "message",
-                                    timeout=8,
-                                    filters=lambda m: m.chat.id == cid and m.reply_to_message and m.reply_to_message.id == sent.id
-                                )
-                                if resp.reply_markup and resp.reply_markup.inline_keyboard:
-                                    await click_until_reply(client, resp, 0, cid)
-                            except asyncio.TimeoutError:
-                                pass
                             await asyncio.sleep(4)
                         except Exception as e:
                             print(f"❌ پیشی: {e}")
                     await asyncio.sleep(interval)
 
-            # ===== حلقه گرفتن =====
             async def catch_loop():
                 while True:
                     u = get_user(phone)
@@ -630,24 +472,13 @@ async def selfbot_worker(phone: str):
                     for cid in chat_ids:
                         try:
                             await global_slot("ماهی")
-                            sent = await client.send_message(cid, "ماهی")
+                            await client.send_message(cid, "ماهی")
                             print(f"🎣 [{phone}] ماهی → {cid}")
-                            try:
-                                resp = await client.wait_for(
-                                    "message",
-                                    timeout=8,
-                                    filters=lambda m: m.chat.id == cid and m.reply_to_message and m.reply_to_message.id == sent.id
-                                )
-                                if resp.reply_markup and resp.reply_markup.inline_keyboard:
-                                    await click_until_reply(client, resp, 0, cid)
-                            except asyncio.TimeoutError:
-                                pass
                             await asyncio.sleep(3)
                         except Exception as e:
                             print(f"❌ ماهی: {e}")
                     await asyncio.sleep(interval)
 
-            # ===== حلقه یخچال =====
             async def fridge_loop():
                 while True:
                     u = get_user(phone)
@@ -676,13 +507,11 @@ async def selfbot_worker(phone: str):
                             print(f"❌ یخچال: {e}")
                     await asyncio.sleep(60)
 
-            # ===== استارت همه‌ی تسک‌ها =====
             tasks = [
                 asyncio.create_task(meow_loop()),
                 asyncio.create_task(fish_loop()),
                 asyncio.create_task(catch_loop()),
                 asyncio.create_task(fridge_loop()),
-                asyncio.create_task(smuggle_loop(client, phone, chat_ids[0])),
             ]
 
             while True:
@@ -695,6 +524,10 @@ async def selfbot_worker(phone: str):
                 t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
 
+        except (SessionRevoked, AuthKeyUnregistered, UserDeactivated, UserDeactivatedBan) as e:
+            print(f"🚫 Session مرده/باطل شده برای {phone}: {e}")
+            # اینجا می‌تونی is_active را False کنی اگر بخوای
+            break
         except Exception as e:
             print(f"❌ خطای بزرگ {phone}: {e}")
         finally:
@@ -707,9 +540,6 @@ async def selfbot_worker(phone: str):
         await asyncio.sleep(15)
 
 
-# ==============================================
-# توابع مدیریت تسک‌ها
-# ==============================================
 def start_worker(phone: str, loop):
     if phone in active_tasks and not active_tasks[phone].done():
         return
