@@ -1,6 +1,7 @@
 import asyncio
 import re
 import time
+import json
 from pyrogram import Client, filters
 from pyrogram.types import Message
 from pyrogram.errors import FloodWait, RPCError
@@ -21,11 +22,10 @@ cooldowns = {}
 # ========== تنظیمات سرعت ==========
 _global_lock = asyncio.Lock()
 _last_global_action = 0.0
-GLOBAL_GAP = 0.3  # کاهش یافته به ۰.۳ ثانیه
+GLOBAL_GAP = 0.3
 
 
 async def global_slot(tag: str = ""):
-    """صف مشترک — قبل از هر کلیک یا send_message"""
     global _last_global_action
     async with _global_lock:
         now = time.time()
@@ -466,7 +466,7 @@ async def process_bot_message(c: Client, message: Message, phone: str):
         print(f"⚠️ خطا پردازش پیام [{phone}]: {e}")
 
 # ==============================================
-# تابع اصلی Worker (با اصلاح گروه‌ها و حلقه‌های به‌روز)
+# تابع اصلی Worker (با اصلاح گروه‌ها و session_string)
 # ==============================================
 async def selfbot_worker(phone: str):
     print(f"🚀 Worker شروع شد برای {phone}")
@@ -479,7 +479,7 @@ async def selfbot_worker(phone: str):
             continue
 
         # ==============================================
-        # ⭐ اصلاح: مدیریت امن گروه‌ها (رفع خطای ASCII)
+        # ⭐ اصلاح ۱: مدیریت امن گروه‌ها (رفع خطای ASCII)
         # ==============================================
         if user.get("selected_groups"):
             raw_groups = user["selected_groups"]
@@ -507,9 +507,28 @@ async def selfbot_worker(phone: str):
 
         print(f"📋 گروه‌های هدف {phone}: {chat_ids}")
 
+        # ==============================================
+        # ⭐ اصلاح ۲: پاکسازی session_string (رفع خطای اصلی)
+        # ==============================================
+        raw_session = user["session_string"]
+        if raw_session:
+            # فقط کاراکترهای مجاز base64 (A-Z a-z 0-9 + / =) را نگه دار
+            cleaned_session = re.sub(r'[^A-Za-z0-9+/=]', '', raw_session)
+        else:
+            cleaned_session = ""
+        
+        # لاگ برای دیباگ
+        print(f"🔑 طول session پاکسازی‌شده: {len(cleaned_session)} (اصلی: {len(raw_session)})")
+        
+        # اگر بعد از پاکسازی خالی شد، خطا بده
+        if not cleaned_session:
+            print(f"❌ session_string برای {phone} نامعتبر است. لطفاً دوباره لاگین کنید.")
+            await asyncio.sleep(60)
+            continue
+
         client = Client(
             name=f"sb_{phone}",
-            session_string=user["session_string"],
+            session_string=cleaned_session,
             api_id=API_ID,
             api_hash=API_HASH,
             in_memory=True
