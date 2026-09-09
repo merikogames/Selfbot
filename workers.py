@@ -3,7 +3,10 @@ import re
 import time
 from pyrogram import Client, filters
 from pyrogram.types import Message
-from pyrogram.errors import FloodWait, RPCError, SessionRevoked, AuthKeyUnregistered, UserDeactivated, UserDeactivatedBan
+from pyrogram.errors import (
+    FloodWait, RPCError, SessionRevoked,
+    AuthKeyUnregistered, UserDeactivated, UserDeactivatedBan
+)
 from config import API_ID, API_HASH, BOT_USER_ID
 from database import get_user, get_all_users, DEFAULT_FISH_RULES, DEFAULT_COOKED_RULES
 
@@ -18,14 +21,12 @@ FRIDGE_CHECK_CD = 20 * 60
 
 cooldowns = {}
 
-# صف سراسری بین همه اکانت‌ها
 _global_lock = asyncio.Lock()
 _last_global_action = 0.0
-GLOBAL_GAP = 10  # ثانیه بین هر کلیک/ارسال
+GLOBAL_GAP = 10
 
 
 async def global_slot(tag: str = ""):
-    """صف مشترک — قبل از هر کلیک یا send_message"""
     global _last_global_action
     async with _global_lock:
         now = time.time()
@@ -90,38 +91,59 @@ def has_btn(message: Message, *names) -> bool:
     return False
 
 
-async def click_exact(message: Message, exact_text: str) -> bool:
-    if not exact_text or not message.reply_markup or not message.reply_markup.inline_keyboard:
-        return False
-    exact_text = exact_text.strip()
-    try:
-        for row in message.reply_markup.inline_keyboard:
-            for btn in row:
-                t = (btn.text or "").strip()
-                if t == exact_text or (exact_text and exact_text in t):
-                    try:
-                        await global_slot(f"click:{t[:20]}")
-                        await message.click(t if t else 0)
-                        print(f"✅ کلیک شد روی: {t or '(خالی)'}")
-                        return True
-                    except Exception as e:
-                        print(f"❌ خطا در کلیک: {e}")
-                        return False
-    except Exception as e:
-        print(f"❌ خطا click_exact: {e}")
-    print(f"⚠️ دکمه «{exact_text}» پیدا نشد")
+# ==================== کلیک قوی با ۲۰ بار تلاش ====================
+
+async def click_until_success(message: Message, target: str | int, max_tries: int = 20) -> bool:
+    for attempt in range(1, max_tries + 1):
+        try:
+            try:
+                fresh = await message._client.get_messages(message.chat.id, message.id)
+                if not fresh or not fresh.reply_markup or not fresh.reply_markup.inline_keyboard:
+                    print(f"⚠️ پیام دیگر دکمه ندارد (تلاش {attempt})")
+                    return False
+                message = fresh
+            except Exception:
+                pass
+
+            if isinstance(target, str):
+                target = target.strip()
+                for row in message.reply_markup.inline_keyboard:
+                    for btn in row:
+                        t = (btn.text or "").strip()
+                        if t == target or (target and target in t):
+                            await global_slot(f"click:{t[:18]}")
+                            await message.click(t)
+                            print(f"✅ کلیک موفق روی «{t}» (تلاش {attempt})")
+                            await asyncio.sleep(1.3)
+                            return True
+                print(f"⚠️ دکمه «{target}» پیدا نشد (تلاش {attempt})")
+            else:
+                await global_slot(f"idx:{target}")
+                await message.click(target)
+                print(f"✅ کلیک index={target} موفق (تلاش {attempt})")
+                await asyncio.sleep(1.3)
+                return True
+
+        except Exception as e:
+            err = str(e).lower()
+            if "message_id_invalid" in err or "message not found" in err or "msg_id_invalid" in err:
+                print(f"⚠️ پیام منقضی شد (تلاش {attempt})")
+                return False
+            print(f"❌ تلاش {attempt}/{max_tries}: {e}")
+            await asyncio.sleep(0.9)
+
+    print(f"❌ بعد از {max_tries} بار نتونست کلیک کنه")
     return False
 
 
-async def click_index(message: Message, index: int) -> bool:
-    try:
-        await global_slot(f"idx:{index}")
-        await message.click(index)
-        print(f"✅ کلیک index={index}")
-        return True
-    except Exception as e:
-        print(f"❌ خطا کلیک index={index}: {e}")
+async def click_exact(message: Message, exact_text: str) -> bool:
+    if not exact_text:
         return False
+    return await click_until_success(message, exact_text.strip(), max_tries=20)
+
+
+async def click_index(message: Message, index: int) -> bool:
+    return await click_until_success(message, index, max_tries=20)
 
 
 async def click_empty_fish_buttons(message: Message) -> bool:
@@ -137,19 +159,17 @@ async def click_empty_fish_buttons(message: Message) -> bool:
                     idx += 1
                     continue
                 if not t or t in ("\u200b", "​", "‌", ""):
-                    try:
-                        await global_slot(f"fish:{idx}")
-                        await message.click(idx)
-                        print(f"✅ کلیک ماهی خالی index={idx}")
+                    success = await click_until_success(message, idx, max_tries=12)
+                    if success:
                         await asyncio.sleep(1.5)
                         return True
-                    except Exception as e:
-                        print(f"❌ خطا کلیک ماهی: {e}")
                 idx += 1
     except Exception as e:
         print(f"❌ خطا click_empty: {e}")
     return False
 
+
+# ==================== نجات ====================
 
 async def rescue_loop(client: Client, chat_id: int, msg_id: int, rescue_btn: str):
     for i in range(40):
@@ -158,27 +178,30 @@ async def rescue_loop(client: Client, chat_id: int, msg_id: int, rescue_btn: str
             if not msg or not msg.reply_markup or not msg.reply_markup.inline_keyboard:
                 print("✅ دکمه نجات ناپدید شد")
                 break
+
             clicked = False
             if rescue_btn:
                 target = rescue_btn.strip()
                 for row in msg.reply_markup.inline_keyboard:
                     for btn in row:
                         if target in (btn.text or ""):
-                            await global_slot(f"rescue:{i+1}")
-                            await msg.click(btn.text)
+                            await click_until_success(msg, btn.text, max_tries=8)
                             clicked = True
                             break
                     if clicked:
                         break
+
             if not clicked:
-                await global_slot(f"rescue0:{i+1}")
-                await msg.click(0)
+                await click_until_success(msg, 0, max_tries=8)
+
             print(f"🚑 نجات کلیک {i+1}")
             await asyncio.sleep(1.4)
         except Exception as e:
             print(f"خطا نجات: {e}")
             break
 
+
+# ==================== منطق ماهی و یخچال ====================
 
 def detect_fish_level(text: str):
     for lv in ["افسانه", "حماسی", "کمیاب", "غیرمعمول", "معمولی", "اسطوره"]:
@@ -200,6 +223,7 @@ async def handle_fish_catch(message: Message, rules: dict, phone: str):
     text = safe_text(message)
     action = choose_fish_action(text, rules)
     print(f"🎣 تصمیم صید: {action} | سطح: {detect_fish_level(text)}")
+
     if action == "fridge":
         ok = await click_exact(message, BTN_FRIDGE)
         if ok:
@@ -263,10 +287,8 @@ async def handle_fridge_message(message: Message, phone: str, rules: dict, cooke
 
         if not is_cooked and action == "fridge":
             if has_btn(message, "بپوخش"):
-                print("🍳 بپوخش (متن)")
                 await click_exact(message, "بپوخش")
             else:
-                print("🍳 بپوخش (index=2)")
                 await click_index(message, 2)
             return
 
@@ -278,6 +300,70 @@ async def handle_fridge_message(message: Message, phone: str, rules: dict, cooke
             await click_exact(message, BTN_SELL)
         return
 
+
+# ==================== قاچاق میویی ====================
+
+async def handle_smuggle(client: Client, chat_id: int, phone: str):
+    try:
+        await global_slot("قاچاق")
+        await client.send_message(chat_id, "قاچاق میویی")
+        print(f"📤 قاچاق میویی ارسال شد")
+        await asyncio.sleep(2.8)
+
+        response = None
+        async for msg in client.get_chat_history(chat_id, limit=10):
+            if msg.from_user and msg.from_user.id == BOT_USER_ID:
+                if msg.reply_markup and msg.reply_markup.inline_keyboard:
+                    response = msg
+                    break
+
+        if not response:
+            print("❌ پاسخ قاچاق پیدا نشد")
+            return
+
+        # مرحله ۱
+        await click_until_success(response, 0, max_tries=15)
+        await asyncio.sleep(1.8)
+
+        # مرحله ۲
+        try:
+            fresh = await client.get_messages(chat_id, response.id)
+            if fresh and fresh.reply_markup:
+                total = sum(len(row) for row in fresh.reply_markup.inline_keyboard)
+                if total >= 3:
+                    await click_until_success(fresh, 2, max_tries=15)
+        except Exception:
+            pass
+
+        set_cd(phone, "smuggle_cooldown", 3600)
+        print("✅ قاچاق میویی با موفقیت انجام شد")
+
+    except Exception as e:
+        print(f"❌ خطا در قاچاق: {e}")
+
+
+async def smuggle_loop(client: Client, phone: str, chat_ids: list):
+    while True:
+        try:
+            left = get_cd_left(phone, "smuggle_cooldown")
+            if left > 0:
+                await asyncio.sleep(min(left, 40))
+                continue
+
+            for cid in chat_ids:
+                u = get_user(phone)
+                if not u or not u["is_active"]:
+                    break
+                await handle_smuggle(client, cid, phone)
+                await asyncio.sleep(4)
+
+            await asyncio.sleep(90)
+        except Exception as e:
+            print(f"❌ خطا در smuggle_loop: {e}")
+            await asyncio.sleep(30)
+
+
+# ==================== پردازش پیام ====================
 
 async def process_bot_message(c: Client, message: Message, phone: str):
     try:
@@ -338,7 +424,6 @@ async def process_bot_message(c: Client, message: Message, phone: str):
                     await handle_fish_catch(message, rules, phone)
                     return
 
-        # برداشت — هر ۳۰ دقیقه یک‌بار
         if u.get("fish_enabled") and has_btn(message, harvest_btn, "برداشت میو"):
             left = get_cd_left(phone, "harvest")
             if left > 0:
@@ -353,6 +438,8 @@ async def process_bot_message(c: Client, message: Message, phone: str):
     except Exception as e:
         print(f"⚠️ خطا پردازش پیام [{phone}]: {e}")
 
+
+# ==================== Worker اصلی ====================
 
 async def selfbot_worker(phone: str):
     print(f"🚀 Worker شروع شد برای {phone}")
@@ -372,7 +459,6 @@ async def selfbot_worker(phone: str):
 
         print(f"📋 گروه‌های هدف {phone}: {chat_ids}")
 
-        # پاکسازی session_string از کاراکترهای اضافی
         session_str = user["session_string"].strip().replace("\n", "").replace("\r", "").replace(" ", "")
 
         client = Client(
@@ -512,6 +598,7 @@ async def selfbot_worker(phone: str):
                 asyncio.create_task(fish_loop()),
                 asyncio.create_task(catch_loop()),
                 asyncio.create_task(fridge_loop()),
+                asyncio.create_task(smuggle_loop(client, phone, chat_ids)),
             ]
 
             while True:
@@ -526,7 +613,6 @@ async def selfbot_worker(phone: str):
 
         except (SessionRevoked, AuthKeyUnregistered, UserDeactivated, UserDeactivatedBan) as e:
             print(f"🚫 Session مرده/باطل شده برای {phone}: {e}")
-            # اینجا می‌تونی is_active را False کنی اگر بخوای
             break
         except Exception as e:
             print(f"❌ خطای بزرگ {phone}: {e}")
