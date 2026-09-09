@@ -279,7 +279,7 @@ async def handle_fridge_message(message: Message, phone: str, rules: dict, cooke
         return
 
 # ==============================================
-# ⭐ اضافه‌شده: تابع کلیک با Retry هر ۱ ثانیه
+# ⭐ تابع کلیک با Retry هر ۱ ثانیه (مقاوم در برابر تایم‌اوت)
 # ==============================================
 async def click_until_reply(client: Client, message: Message, button_index: int, chat_id: int):
     """
@@ -315,7 +315,7 @@ async def click_until_reply(client: Client, message: Message, button_index: int,
                 break
 
 # ==============================================
-# ⭐ اضافه‌شده: قاچاق میویی (دو مرحله‌ای)
+# ⭐ قاچاق میویی (دو مرحله‌ای با کول‌داون ۱ ساعته)
 # ==============================================
 async def handle_smuggle(client: Client, chat_id: int, phone: str):
     step = get_cd_left(phone, "smuggle_step")
@@ -465,9 +465,8 @@ async def process_bot_message(c: Client, message: Message, phone: str):
     except Exception as e:
         print(f"⚠️ خطا پردازش پیام [{phone}]: {e}")
 
-
 # ==============================================
-# تابع اصلی Worker (با حلقه‌های به‌روز شده)
+# تابع اصلی Worker (با اصلاح گروه‌ها و حلقه‌های به‌روز)
 # ==============================================
 async def selfbot_worker(phone: str):
     print(f"🚀 Worker شروع شد برای {phone}")
@@ -479,8 +478,29 @@ async def selfbot_worker(phone: str):
             await asyncio.sleep(20)
             continue
 
-        if user["selected_groups"]:
-            chat_ids = [int(g) for g in user["selected_groups"]]
+        # ==============================================
+        # ⭐ اصلاح: مدیریت امن گروه‌ها (رفع خطای ASCII)
+        # ==============================================
+        if user.get("selected_groups"):
+            raw_groups = user["selected_groups"]
+            chat_ids = []
+            for g in raw_groups:
+                try:
+                    if isinstance(g, str):
+                        # حذف کاراکترهای غیرعددی (به جز منفی)
+                        cleaned = ''.join(c for c in g if c.isdigit() or c == '-')
+                        if cleaned:
+                            chat_ids.append(int(cleaned))
+                    elif isinstance(g, int):
+                        chat_ids.append(g)
+                    else:
+                        print(f"⚠️ نوع داده نامعتبر: {type(g)} -> {g}")
+                except (ValueError, TypeError) as e:
+                    print(f"⚠️ شناسه نامعتبر نادیده گرفته شد: {g} -> {e}")
+                    continue
+            if not chat_ids:
+                chat_ids = [-1003998125518]
+                print("⚠️ گروه پیش‌فرض (پس از پاکسازی)")
         else:
             chat_ids = [-1003998125518]
             print("⚠️ گروه پیش‌فرض")
@@ -549,7 +569,6 @@ async def selfbot_worker(phone: str):
                             await global_slot("میو")
                             sent = await client.send_message(cid, "میو")
                             print(f"😺 [{phone}] میو → {cid}")
-                            # اگر پاسخ دکمه داشت، با retry کلیک کن
                             try:
                                 resp = await client.wait_for(
                                     "message",
@@ -684,7 +703,9 @@ async def selfbot_worker(phone: str):
 
         await asyncio.sleep(15)
 
-
+# ==============================================
+# توابع مدیریت تسک‌ها
+# ==============================================
 def start_worker(phone: str, loop):
     if phone in active_tasks and not active_tasks[phone].done():
         return
